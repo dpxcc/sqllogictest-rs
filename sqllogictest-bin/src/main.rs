@@ -132,6 +132,15 @@ struct Opt {
     /// Total number of partitions for test sharding. More details in `partition_id`.
     #[clap(long, env = PARTITION_COUNT_ENV_KEY)]
     partition_count: Option<u64>,
+
+    /// Timeout in seconds for shutting down the connections to the database.
+    /// `0` means to wait forever.
+    #[clap(
+        long = "shutdown-timeout",
+        default_value = "10",
+        env = "SLT_SHUTDOWN_TIMEOUT"
+    )]
+    shutdown_timeout_secs: u64,
 }
 
 /// Connection configuration.
@@ -241,6 +250,7 @@ pub async fn main() -> Result<()> {
         labels,
         partition_count,
         partition_id,
+        shutdown_timeout_secs,
     } = Opt::from_arg_matches(&matches)
         .map_err(|err| err.exit())
         .unwrap();
@@ -346,6 +356,7 @@ pub async fn main() -> Result<()> {
         junit: junit.clone(),
         fail_fast,
         cancel,
+        shutdown_timeout_secs,
     };
 
     let result = if let Some(jobs) = jobs {
@@ -377,6 +388,7 @@ struct RunConfig {
     junit: Option<String>,
     fail_fast: bool,
     cancel: CancellationToken,
+    shutdown_timeout_secs: u64,
 }
 
 async fn run_parallel(
@@ -391,6 +403,7 @@ async fn run_parallel(
         junit,
         fail_fast,
         cancel,
+        shutdown_timeout_secs,
     }: RunConfig,
 ) -> Result<()> {
     let mut create_databases = BTreeMap::new();
@@ -440,6 +453,7 @@ async fn run_parallel(
                         config,
                         &labels,
                         cancel,
+                        shutdown_timeout_secs,
                     )
                     .await
                 }))
@@ -536,6 +550,7 @@ async fn run_serial(
         junit,
         fail_fast,
         cancel,
+        shutdown_timeout_secs,
     }: RunConfig,
 ) -> Result<()> {
     let mut failed_cases = vec![];
@@ -551,6 +566,7 @@ async fn run_serial(
             config.clone(),
             &labels,
             cancel.clone(),
+            shutdown_timeout_secs,
         )
         .await;
         stdout().flush()?;
@@ -698,6 +714,7 @@ async fn connect_and_run_test_file(
     config: DBConfig,
     labels: &[String],
     cancel: CancellationToken,
+    shutdown_timeout_secs: u64,
 ) -> RunResult {
     static RUNNING_TESTS: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
@@ -741,7 +758,7 @@ async fn connect_and_run_test_file(
             .unwrap();
             RunResult::Cancelled
         }
-        result = run_test_file(&mut out, &mut runner, filename) => {
+        result = run_test_file(&mut out, &mut runner, filename.clone()) => {
             if let Err(err) = &result {
                 writeln!(
                     out,
@@ -756,7 +773,21 @@ async fn connect_and_run_test_file(
     };
 
     out.finish();
-    runner.shutdown_async().await;
+
+    match shutdown_timeout_secs {
+        0 => runner.shutdown_async().await,
+        secs => {
+            if tokio::time::timeout(Duration::from_secs(secs), runner.shutdown_async())
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "shutting down connection to database for test {} timed out",
+                    filename.display()
+                )
+            }
+        }
+    }
 
     result
 }
